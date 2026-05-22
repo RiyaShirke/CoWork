@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+logs/
+state/
+inbox/
+processed/
+failed/
+output/
+!output/.keep
