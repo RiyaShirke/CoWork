@@ -95,11 +95,12 @@ every product row visible in the input — no summarising, no skipping.
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts\setup_docker.ps1
    ```
-   This `pip install`s `requirements.txt`, pulls
-   `paddlecloud/paddleocr:2.6-cpu-latest`, starts the `cowork-ollama`
-   container on `localhost:11434`, and pulls `llama3.1:8b`. Override the
-   model with `$env:OLLAMA_MODEL = 'qwen2.5:7b'` etc. before running.
-   (`llama3.2:1b` will hallucinate against this schema — don't use it.)
+   This `pip install`s `requirements.txt` (including **Kreuzberg** for
+   table-aware PDF extraction), pulls `paddlecloud/paddleocr:2.6-cpu-latest`,
+   starts the `cowork-ollama` container on `localhost:11434`, and pulls
+   `qwen2.5:7b`. Override the model with `$env:OLLAMA_MODEL = 'llama3.1:8b'`
+   etc. before running. Anything 3b or smaller will drop fields on a
+   27-column schema with nested batches — don't use it.
 
    **GPU is auto-detected.** If `nvidia-smi` works on the host the script
    also applies `docker-compose.gpu.yml` so Ollama loads weights into VRAM

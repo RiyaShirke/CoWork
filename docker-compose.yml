@@ -8,5 +8,15 @@ services:
     volumes:
       - ollama_models:/root/.ollama
 
+  kreuzberg:
+    image: ghcr.io/kreuzberg-dev/kreuzberg:latest
+    container_name: cowork-kreuzberg
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - kreuzberg_cache:/app/.kreuzberg
+
 volumes:
   ollama_models:
+  kreuzberg_cache:

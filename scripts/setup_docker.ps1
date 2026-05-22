@@ -32,7 +32,7 @@ if (-not (Test-Path $RequirementsTxt)) {
     throw "requirements.txt not found at $RequirementsTxt"
 }
 
-$Model = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { 'llama3.1:8b' }
+$Model = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { 'qwen2.5:7b' }
 $PaddleImage = if ($env:PADDLE_IMAGE) { $env:PADDLE_IMAGE } else { 'paddlecloud/paddleocr:2.6-cpu-latest' }
 
 # Prefer `py -3` if available (the Windows launcher); fall back to `python`.
@@ -54,6 +54,11 @@ Write-Host ""
 Write-Host "==> Pulling PaddleOCR image: $PaddleImage"
 docker pull $PaddleImage
 if ($LASTEXITCODE -ne 0) { throw "docker pull failed for $PaddleImage" }
+
+Write-Host ""
+Write-Host "==> Pulling Kreuzberg image: ghcr.io/kreuzberg-dev/kreuzberg:latest"
+docker pull ghcr.io/kreuzberg-dev/kreuzberg:latest
+if ($LASTEXITCODE -ne 0) { throw "docker pull failed for Kreuzberg" }
 
 # --- GPU detection -----------------------------------------------------------
 $UseGpu = $false
@@ -85,13 +90,13 @@ if ($env:COWORK_FORCE_CPU -eq '1') {
     }
 }
 
-# --- Bring up Ollama ---------------------------------------------------------
+# --- Bring up services -------------------------------------------------------
 Write-Host ""
 if ($UseGpu) {
-    Write-Host "==> Bringing up Ollama with GPU passthrough (base + .gpu overlay)"
+    Write-Host "==> Bringing up services with Ollama GPU passthrough (base + .gpu overlay)"
     docker compose -f $ComposeFile -f $ComposeGpuFile up -d
 } else {
-    Write-Host "==> Bringing up Ollama (CPU)"
+    Write-Host "==> Bringing up services (Ollama on CPU)"
     docker compose -f $ComposeFile up -d
 }
 if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
@@ -106,6 +111,19 @@ for ($i = 0; $i -lt 30; $i++) {
     } catch { Start-Sleep -Seconds 2 }
 }
 if (-not $ready) { throw "Ollama did not become ready within 60s" }
+
+Write-Host ""
+Write-Host "==> Waiting for Kreuzberg to accept connections on :8000"
+$kzReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+    try {
+        $r = Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 2
+        if ($r.StatusCode -eq 200) { Write-Host "    ready."; $kzReady = $true; break }
+    } catch { Start-Sleep -Seconds 2 }
+}
+if (-not $kzReady) {
+    Write-Host "    WARNING: Kreuzberg did not become ready within 60s — worker will fall back to pdfplumber."
+}
 
 # Verify GPU actually passed through into the container (otherwise the model
 # loads on CPU silently, which is the worst of both worlds).
@@ -131,10 +149,13 @@ if ($LASTEXITCODE -ne 0) { throw "ollama pull failed for $Model" }
 
 $Mode = if ($GpuInContainer) { "GPU ($GpuName)" } elseif ($UseGpu) { "CPU (GPU detected but not passing through)" } else { "CPU" }
 
+$KreuzbergStatus = if ($kzReady) { "ready (http://localhost:8000)" } else { "NOT READY — pdfplumber fallback will be used" }
+
 Write-Host ""
 Write-Host "Bootstrap complete."
 Write-Host "  Python          : $PythonCmd"
 Write-Host "  PaddleOCR image : $PaddleImage"
+Write-Host "  Kreuzberg       : $KreuzbergStatus"
 Write-Host "  Ollama model    : $Model"
 Write-Host "  Ollama endpoint : http://localhost:11434"
 Write-Host "  Inference mode  : $Mode"

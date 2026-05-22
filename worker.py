@@ -89,7 +89,7 @@ PADDLE_CACHE_DIR = _env_path("PADDLE_CACHE_DIR", STATE_DIR / "paddleocr-cache")
 PDF_OCR_DPI = _env_int("PDF_OCR_DPI", 200)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_TIMEOUT = _env_int("OLLAMA_TIMEOUT", 600)
 OLLAMA_NUM_CTX = _env_int("OLLAMA_NUM_CTX", 8192)
 OLLAMA_NUM_PREDICT = _env_int("OLLAMA_NUM_PREDICT", 16384)
@@ -102,6 +102,9 @@ OLLAMA_RETRY_BACKOFF_SEC = _env_int("OLLAMA_RETRY_BACKOFF_SEC", 5)
 # image-based and run OCR as well. Stock statements with thousands of product
 # rows but only a tiny embedded text layer (header only) fall here.
 PDF_TEXT_MIN_CHARS = _env_int("PDF_TEXT_MIN_CHARS", 1500)
+
+KREUZBERG_URL = os.environ.get("KREUZBERG_URL", "http://localhost:8000").strip().rstrip("/")
+KREUZBERG_TIMEOUT = _env_int("KREUZBERG_TIMEOUT", 180)
 
 NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
 
@@ -317,12 +320,119 @@ def discover_inbox() -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Text extraction — PDF first, OCR fallback
+# Text extraction — Kreuzberg first (preserves table structure as Markdown),
+# pdfplumber as fallback, PaddleOCR Docker as final fallback for scanned PDFs.
 # ---------------------------------------------------------------------------
 
 
-def _extract_pdf_text_native(pdf_path: Path) -> str:
-    """Use pdfplumber for text-based PDFs. Returns '' if no text found."""
+_KREUZBERG_CONFIG = {
+    # Render the body as Markdown so headings/lists/tables come back in a
+    # form the LLM understands well.
+    "output_format": "markdown",
+    # Include hierarchical document structure (helps with long multi-page docs).
+    "include_document_structure": True,
+    "pdf_options": {
+        # Default true, but stated explicitly so a future server-default
+        # change doesn't silently disable us.
+        "extract_tables": True,
+        # CRITICAL for distributor stock statements: their "tables" are
+        # often just column-aligned text without proper PDF table objects.
+        # Kreuzberg's stricter default rejects them; this lets them through.
+        "allow_single_column_tables": True,
+    },
+}
+
+
+def _kreuzberg_tables_to_markdown(tables: list[dict]) -> str:
+    """Serialise Kreuzberg's structured tables to Markdown for the LLM."""
+    parts: list[str] = []
+    for idx, table in enumerate(tables, start=1):
+        md = (table.get("markdown") or "").strip()
+        if md:
+            parts.append(f"### Table {idx} (page {table.get('page_number', '?')})\n\n{md}")
+            continue
+        cells = table.get("cells") or []
+        if not cells:
+            continue
+        rows = ["| " + " | ".join(str(c) for c in row) + " |" for row in cells]
+        if rows:
+            header = rows[0]
+            sep = "| " + " | ".join("---" for _ in cells[0]) + " |"
+            parts.append("\n".join([header, sep] + rows[1:]))
+    return "\n\n".join(parts)
+
+
+def _extract_with_kreuzberg(pdf_path: Path) -> str:
+    """Extract text + structured tables via the Kreuzberg REST service.
+
+    Sends an extraction config that asks Kreuzberg to (a) render output as
+    Markdown, (b) detect tables even when they're just column-aligned text
+    (typical of distributor stock statements). If the response carries
+    structured tables we prepend them to the body so the LLM sees the
+    table grid first; otherwise we just return the Markdown body.
+    """
+    if not KREUZBERG_URL:
+        return ""
+    try:
+        with pdf_path.open("rb") as f:
+            r = requests.post(
+                f"{KREUZBERG_URL}/extract",
+                files={"files": (pdf_path.name, f, "application/pdf")},
+                data={"config": json.dumps(_KREUZBERG_CONFIG)},
+                timeout=KREUZBERG_TIMEOUT,
+            )
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        log.warning("Kreuzberg unreachable at %s (%s); falling back.", KREUZBERG_URL, exc)
+        return ""
+    except requests.RequestException as exc:
+        log.warning("Kreuzberg request failed (%s); falling back.", exc)
+        return ""
+
+    if r.status_code != 200:
+        log.warning("Kreuzberg API returned %s: %s", r.status_code, r.text[:200])
+        return ""
+    try:
+        results = r.json()
+    except ValueError:
+        log.warning("Kreuzberg response was not JSON")
+        return ""
+    if not isinstance(results, list) or not results:
+        return ""
+    first = results[0] if isinstance(results[0], dict) else {}
+    content = (first.get("content") or "").strip()
+    tables = first.get("tables") or []
+    pages = first.get("pages") or []
+
+    # Prefer the per-page content because it preserves line breaks between rows.
+    # Kreuzberg's top-level `content` field sometimes runs everything together
+    # which makes column-aligned tables ambiguous for the LLM.
+    if pages:
+        page_chunks = []
+        for p in pages:
+            page_text = (p.get("content") or "").strip()
+            if page_text:
+                page_chunks.append(f"### Page {p.get('page_number', '?')}\n\n{page_text}")
+        if page_chunks:
+            body = "\n\n".join(page_chunks)
+        else:
+            body = content
+    else:
+        body = content
+
+    log.info(
+        "Kreuzberg: body=%d chars, %d page(s), %d structured table(s), output_format=%s",
+        len(body), len(pages), len(tables),
+        (first.get("metadata") or {}).get("output_format", "?"),
+    )
+    if tables:
+        tables_md = _kreuzberg_tables_to_markdown(tables)
+        if tables_md:
+            return f"{tables_md}\n\n--- BODY ---\n\n{body}"
+    return body
+
+
+def _extract_with_pdfplumber(pdf_path: Path) -> str:
+    """Fallback text extractor when Kreuzberg isn't installed or yields nothing."""
     try:
         import pdfplumber  # type: ignore
     except ImportError as exc:
@@ -342,6 +452,23 @@ def _extract_pdf_text_native(pdf_path: Path) -> str:
                     if cells:
                         pieces.append("\t".join(cells))
     return "\n".join(pieces).strip()
+
+
+def _extract_pdf_text_native(pdf_path: Path) -> str:
+    """Return the best native text we can get for this PDF.
+
+    Order: Kreuzberg (markdown w/ tables) → pdfplumber (plain text + tab-joined
+    tables). We keep whichever produced more content; on ties Kreuzberg wins
+    because table layout is the bigger LLM-accuracy lever.
+    """
+    kz = _extract_with_kreuzberg(pdf_path)
+    if kz:
+        log.info("Kreuzberg extracted %d chars", len(kz))
+        return kz
+    pp = _extract_with_pdfplumber(pdf_path)
+    if pp:
+        log.info("pdfplumber extracted %d chars (Kreuzberg returned nothing)", len(pp))
+    return pp
 
 
 def _render_pdf_pages_to_images(pdf_path: Path, out_dir: Path) -> list[Path]:
@@ -533,44 +660,137 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
-SYSTEM_PROMPT = f"""You are an information-extraction engine for distributor stock-statement PDFs.
+SYSTEM_PROMPT = """You are an information-extraction engine for distributor stock-statement PDFs.
 
-You will receive the raw text of one stock statement (extracted from a PDF or via OCR). Return STRICT JSON with two keys:
+You receive the text of ONE stock statement (extracted from PDF text or OCR). Different distributors print very different layouts — different column orders, different column names, different sets of columns. Your job is to (a) FIND the column header row in this specific document, (b) MAP each header label to the corresponding schema field below, and (c) PARSE each product row positionally against that mapping.
 
-1. "metadata" — object with these fields (use null if not present):
-   - DistributorName: company / distributor name on the report header
-   - DivisionName: division or business unit, if shown
-   - ReportFromDate: start of the reporting period, ISO YYYY-MM-DD when possible else original string
-   - ReportToDate: end of the reporting period, same format rules
-   - TotalStockValue: report-level total stock value (numeric or string with original formatting)
-   - TotalSalesValue: report-level total sales value
+Return STRICT JSON with two keys: "metadata" and "products".
 
-2. "products" — array; one element per product/inventory row. Each element has these fields (null when not present):
-   - ProductCode
-   - ProductName
-   - Packing
-   - OpeningStock
-   - PurchaseQty
-   - SalesQty
-   - ClosingStock
-   - StockValue
-   - SalesValue
-   - AdjustmentQty
-   - PreviousMonthStock
-   - TwoMonthOldStock
-   - OldStock120Days
-   - ExpiryWithin3Months
-   - batches: array of batch objects (empty array if no batches for this product)
-     Each batch object has: BatchNumber, ExpiryDate, BatchStock, MRP, BatchValue.
+## 1. metadata (object)
+   - DistributorName       : company / distributor name on the report header
+   - DivisionName          : division or business unit, if shown
+   - ReportFromDate        : start of reporting period (ISO YYYY-MM-DD when unambiguous, else original)
+   - ReportToDate          : end of reporting period
+   - TotalStockValue       : footer total stock value
+   - TotalSalesValue       : footer total sales value
 
-Rules:
-- Extract EVERY product row visible in the input. Do not summarise or skip rows.
-- If batch information is shown for a product, include every batch.
-- Dates as ISO YYYY-MM-DD when unambiguous; otherwise keep the original string.
-- Numbers: keep as plain numbers without currency symbols (commas as thousands separators are fine inside strings).
-- Use null (not "" or "N/A") for fields that are genuinely absent.
-- Ignore decorative text, page headers, footers, separators, and page numbers.
-- Output JSON only — no markdown fences, no commentary, no trailing prose.
+Use null for any field that is genuinely not present.
+
+## 2. products (array; one element per product row)
+Each element has:
+   - ProductCode           : the SKU / item code, usually leftmost on the row
+   - ProductName           : product description (often multi-word — keep ALL words until the packing token)
+   - Packing               : packing/strip/size token (e.g. "10T", "10C", "60ML", "1GM", "SACHET", "VIAL")
+   - OpeningStock          : opening quantity
+   - PurchaseQty           : quantity purchased during the period
+   - SalesQty              : quantity sold
+   - ClosingStock          : closing quantity
+   - StockValue            : monetary value of closing stock (usually has a decimal point)
+   - SalesValue            : monetary value of sales (usually has a decimal point)
+   - AdjustmentQty         : adjustment / correction qty (often absent)
+   - PreviousMonthStock    : 30-day-old stock (often absent)
+   - TwoMonthOldStock      : 60-day-old stock (often absent)
+   - OldStock120Days       : 120-day-old stock (often absent)
+   - ExpiryWithin3Months   : stock expiring within 3 months (often absent)
+   - batches               : array; one element per batch row that appears under this product (empty array if none)
+       BatchNumber, ExpiryDate, BatchStock, MRP, BatchValue
+
+## Step 1 — find the column header
+
+Scan the top of the document for a line of column labels. Common labels and their schema mappings (case-insensitive, fuzzy):
+
+| Label seen in the report                                            | Schema field            |
+|---------------------------------------------------------------------|-------------------------|
+| Code / Item Code / SKU / Product Code                               | ProductCode             |
+| Item / Item Description / Product Description / Particulars / Name  | ProductName             |
+| Packing / Pack / Pkg / Strip                                        | Packing                 |
+| Opening / OpStk / OPSTK / Op-Stk / OPN                              | OpeningStock            |
+| Purchase / Purch / PURCH / Recd / Received / Inward                 | PurchaseQty             |
+| Sale / Sales / SLS / SALE / Issued / Outward                        | SalesQty                |
+| Closing / ClStk / CL-STK / STOCK / Bal / Balance                    | ClosingStock            |
+| Stock-Value / StkVal / STK VAL / Closing Value                      | StockValue              |
+| Sales-Value / SaleVal / SALE VAL / SLS VAL / Sale Amt               | SalesValue              |
+| Adj / Adjustment / IN/OT / IN-OUT / Cor                             | AdjustmentQty           |
+| Feb / Prev / Previous Month / Last Month / -1M                      | PreviousMonthStock      |
+| Jan / 2 Months / -2M / 60D                                          | TwoMonthOldStock        |
+| 120 / 120D / STK120 / 4 Months / +120 Days                          | OldStock120Days         |
+| ExpYr / EXP3M / Exp 3M / Expiry 3 Months / Near Expiry              | ExpiryWithin3Months     |
+
+Use the header to LOCK the column order for THIS document. Different vendors print the same data in different orders — do not assume any fixed order.
+
+If the document has NO ProductCode column, leave ProductCode = null for every row. (Plenty of distributors skip it.)
+
+## Step 2 — parse each product row positionally
+
+Product rows are usually whitespace-separated tokens. Apply these rules:
+
+1. **ProductCode** (when present in the header): leftmost token on the row that matches the code pattern (usually digits, sometimes alphanumeric).
+2. **ProductName**: every token between the code (or start of line) and the packing token. May be MULTIPLE words like "FLUVIR 75 (H1)" or "HIFEN 200MG DT TAB H1".
+3. **Packing**: the first token after the name that matches a packing pattern — ends in T/TAB/C/CAP/ML/GM/KG/G/MG, contains SACHET/VIAL/TUBE/BOTTLE/STRIP/CAPS/POWDER/SYP/SUSPENSION, or is a literal `NA`. Packing may span TWO tokens (e.g. "10 TAB", "6 TAB"). When in doubt, the packing is the shortest sensible prefix.
+4. **Numeric columns**: every remaining token, in the SAME ORDER as the header you identified. Tokens with a decimal point (`.`) are almost always monetary values, not quantities.
+5. **Zero-suppression**: many reports print "" or blank for zero values, so a row may have FEWER tokens than the header has columns. The omitted columns are USUALLY the trailing ones (right side) — but not always. If you can't be sure which column a token belongs to, leave that field null. NEVER guess.
+6. **Strip commas** from numbers ("1,234.56" → 1234.56) but preserve decimals.
+
+### Worked example A — code-prefixed layout (e.g. CHiNTAN AGENCIES)
+Header: `Code  Item Description  Packing  Opening  Purchase  Sales  Closing  Stock-Value  Sales-Value`
+
+Row: `11071 FLUVIR 75 (H1) 10C 154 0 39 115 41835.05 13473.25`
+Parse:
+   ProductCode  = "11071"
+   ProductName  = "FLUVIR 75 (H1)"
+   Packing      = "10C"
+   OpeningStock = 154
+   PurchaseQty  = 0
+   SalesQty     = 39
+   ClosingStock = 115
+   StockValue   = 41835.05
+   SalesValue   = 13473.25
+
+Zero-suppressed: `44769 FLUVIR 30 (H1) 10C 5 0 5 927.89`
+Only ONE decimal token → 927.89 = StockValue, SalesValue = null.
+Three ints (5, 0, 5) → Opening=5, Purchase=0, Closing=5, Sales = null.
+
+### Worked example B — no-code layout with old-stock columns (e.g. SAMARTH DISTRIBUTORS / ST-HMAIN)
+Header: `PRODUCT DESCRIPTION  PACKING  OPSTK  PURCH  SALE  SALE VAL  IN/OT  STOCK  STK VAL  FEB  JAN  STK120  EXP3M`
+
+(No code column → ProductCode = null for every row.)
+
+Row: `ENUFF 10 SACHET 1GM 235 500 293 3293 0 442 4469 187 379`
+Parse:
+   ProductCode         = null
+   ProductName         = "ENUFF 10 SACHET"
+   Packing             = "1GM"
+   OpeningStock        = 235
+   PurchaseQty         = 500
+   SalesQty            = 293
+   SalesValue          = 3293
+   AdjustmentQty       = 0
+   ClosingStock        = 442
+   StockValue          = 4469
+   PreviousMonthStock  = 187
+   TwoMonthOldStock    = 379
+   OldStock120Days     = null
+   ExpiryWithin3Months = null
+   (the last two trailing columns were absent — zero-suppression)
+
+## Batch lines
+A line that starts with "Batch" or contains "Batch :" / "Batch No" belongs to the most recent product above it. Example:
+   Batch : HH2503138  Stock : 1  ExPDt : 08/26  MRP : 247.75  Value : 169.89
+Extract: BatchNumber="HH2503138", BatchStock=1, ExpiryDate="08/26" (or normalised), MRP=247.75, BatchValue=169.89.
+
+## Other layouts you may see
+- Proper Markdown tables (`| col | col |` rows). When the input already has these, use them directly — the column names tell you exactly which schema field each cell maps to.
+- Multi-page reports: products may continue across page breaks. Keep extracting; only stop at TOTALS / Grand Total / End of Report.
+- Some distributors split product info across two lines (name on line 1, numbers on line 2). Re-assemble before parsing.
+- Numbers may use comma thousands separators (e.g. "1,996.20"). Strip commas before emitting.
+
+## Output rules
+- Extract EVERY product row visible. Do not summarise, skip, or merge rows.
+- Output JSON only — no markdown fences, no commentary, no prose.
+- Use null (not "" or "N/A" or "-") for absent fields.
+- Numbers as plain numerics where possible; if the source text is ambiguous, keep the original string.
+- Dates in ISO YYYY-MM-DD when you can determine the format; otherwise keep the original.
+- Never invent data not visible in the input.
 """
 
 
@@ -760,7 +980,45 @@ def validate_and_normalize(raw: dict) -> ExtractedDoc:
     if not norm_products:
         raise FileExtractionError("LLM returned zero products")
 
+    _log_totals_reconciliation(norm_meta, norm_products)
     return ExtractedDoc(metadata=norm_meta, products=norm_products)
+
+
+def _to_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _log_totals_reconciliation(metadata: dict, products: list[dict]) -> None:
+    """Soft check: sum(product.StockValue) should ≈ TotalStockValue. Logs only —
+    never fails the extraction. Lets a human notice if the model is dropping
+    rows or miscounting columns on a particular vendor format.
+    """
+    expected_stk = _to_float(metadata.get("TotalStockValue"))
+    expected_sal = _to_float(metadata.get("TotalSalesValue"))
+    sum_stk = sum(filter(None, (_to_float(p.get("StockValue")) for p in products)))
+    sum_sal = sum(filter(None, (_to_float(p.get("SalesValue")) for p in products)))
+
+    def _delta(actual: float, expected: float | None) -> str:
+        if expected is None or expected == 0:
+            return "n/a"
+        return f"{(actual - expected) / expected * 100:+.1f}%"
+
+    log.info(
+        "Totals reconciliation: products=%d  sum(StockValue)=%.2f vs report=%s (%s)  sum(SalesValue)=%.2f vs report=%s (%s)",
+        len(products),
+        sum_stk, expected_stk if expected_stk is not None else "?",
+        _delta(sum_stk, expected_stk),
+        sum_sal, expected_sal if expected_sal is not None else "?",
+        _delta(sum_sal, expected_sal),
+    )
 
 
 def flatten_rows(doc: ExtractedDoc, source_file: str, processed_at: str) -> list[list[Any]]:
