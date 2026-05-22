@@ -1,0 +1,21 @@
+# Overlay that grants the Ollama container access to NVIDIA GPUs.
+# Use together with the base compose:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Requirements on the host:
+#   * NVIDIA Windows driver (recent enough to expose WSL2 GPU — basically any
+#     driver from 2022+).
+#   * Docker Desktop with the WSL2 backend (the default on Windows 11).
+#   * `nvidia-smi` must work in a regular PowerShell window on the host.
+#
+# setup_docker.ps1 auto-applies this overlay when it detects an NVIDIA GPU.
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -92,16 +92,22 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_TIMEOUT = _env_int("OLLAMA_TIMEOUT", 600)
 OLLAMA_NUM_CTX = _env_int("OLLAMA_NUM_CTX", 8192)
-OLLAMA_NUM_PREDICT = _env_int("OLLAMA_NUM_PREDICT", 4096)
+OLLAMA_NUM_PREDICT = _env_int("OLLAMA_NUM_PREDICT", 16384)
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 OLLAMA_MAX_TEXT_CHARS = _env_int("OLLAMA_MAX_TEXT_CHARS", 24000)
 OLLAMA_RETRY_ATTEMPTS = _env_int("OLLAMA_RETRY_ATTEMPTS", 3)
 OLLAMA_RETRY_BACKOFF_SEC = _env_int("OLLAMA_RETRY_BACKOFF_SEC", 5)
 
+# Minimum chars of native PDF text below which we treat the PDF as effectively
+# image-based and run OCR as well. Stock statements with thousands of product
+# rows but only a tiny embedded text layer (header only) fall here.
+PDF_TEXT_MIN_CHARS = _env_int("PDF_TEXT_MIN_CHARS", 1500)
+
 NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
 
 STATE_FILE = STATE_DIR / "processed.json"
 LOCK_FILE = STATE_DIR / "worker.lock"
+DEBUG_DIR = STATE_DIR / "debug"
 LOCK_STALE_SECONDS = _env_int("LOCK_STALE_SECONDS", 60 * 60)
 
 REPORT_META_COLUMNS = [
@@ -418,21 +424,42 @@ def _run_paddleocr_on_image(image: Path) -> str:
     return result.stdout.strip()
 
 
+def _ocr_pdf_pages(pdf_path: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="cowork-pdf-") as scratch:
+        pages = _render_pdf_pages_to_images(pdf_path, Path(scratch))
+        ocr_pieces = [_run_paddleocr_on_image(p) for p in pages]
+    text = "\n".join(s for s in ocr_pieces if s)
+    log.info("OCR (scanned PDF, %d page(s)): %d chars", len(ocr_pieces), len(text))
+    return text
+
+
 def extract_text(path: Path) -> str:
-    """Return the best available text representation of a bill/statement file."""
+    """Return the best available text representation of a bill/statement file.
+
+    For PDFs we run native extraction first (fast + accurate when it works),
+    but fall back to OCR if the result is suspiciously short — many stock
+    statements embed only their header as real text and rasterise the body,
+    which would otherwise leave us with only a few hundred chars to feed the
+    LLM.
+    """
     ext = path.suffix.lower()
     if ext in PDF_EXTS:
         native = _extract_pdf_text_native(path)
-        if native:
-            log.info("PDF native text: %d chars", len(native))
+        log.info("PDF native text: %d chars (threshold=%d)", len(native), PDF_TEXT_MIN_CHARS)
+        if len(native) >= PDF_TEXT_MIN_CHARS:
             return native
-        log.info("PDF had no embedded text; rendering to images for OCR.")
-        with tempfile.TemporaryDirectory(prefix="cowork-pdf-") as scratch:
-            pages = _render_pdf_pages_to_images(path, Path(scratch))
-            ocr_pieces = [_run_paddleocr_on_image(p) for p in pages]
-        text = "\n".join(s for s in ocr_pieces if s)
-        log.info("OCR (scanned PDF, %d page(s)): %d chars", len(ocr_pieces), len(text))
-        return text
+        if native:
+            log.warning(
+                "PDF native text below threshold (%d < %d); supplementing with OCR.",
+                len(native), PDF_TEXT_MIN_CHARS,
+            )
+        else:
+            log.info("PDF had no embedded text; running OCR.")
+        ocr_text = _ocr_pdf_pages(path)
+        if native and ocr_text:
+            # Keep both — native often has clean header values, OCR has the body.
+            return native + "\n\n--- OCR ---\n" + ocr_text
+        return ocr_text or native
     if ext in IMAGE_EXTS:
         text = _run_paddleocr_on_image(path)
         log.info("OCR (image): %d chars", len(text))
@@ -560,14 +587,24 @@ def _compact_text(text: str) -> str:
     return compact[:head_chars].rstrip() + "\n...\n" + compact[-tail_chars:].lstrip()
 
 
-def call_ollama(text: str) -> dict:
+def _dump_debug(label: str, content: str) -> Path | None:
+    """Write a failure artefact to state/debug/ for after-the-fact inspection."""
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEBUG_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}__{label}"
+        path.write_text(content, encoding="utf-8")
+        return path
+    except OSError as exc:
+        log.warning("Could not write debug dump %s: %s", label, exc)
+        return None
+
+
+def call_ollama(text: str, source_file: str = "input") -> dict:
     prompt_text = _compact_text(text)
-    if len(prompt_text) != len(text):
-        log.info(
-            "Ollama: compacted text %d -> %d chars",
-            len(text),
-            len(prompt_text),
-        )
+    log.info(
+        "Ollama: input text raw=%d chars, compacted=%d chars",
+        len(text), len(prompt_text),
+    )
 
     payload = {
         "model": OLLAMA_MODEL,
@@ -582,8 +619,8 @@ def call_ollama(text: str) -> dict:
         },
     }
     log.info(
-        "Ollama: POST /api/generate (model=%s, chars=%d, timeout=%ds)",
-        OLLAMA_MODEL, len(prompt_text), OLLAMA_TIMEOUT,
+        "Ollama: POST /api/generate (model=%s, num_ctx=%d, num_predict=%d, timeout=%ds)",
+        OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT, OLLAMA_TIMEOUT,
     )
 
     last_err: Exception | None = None
@@ -623,19 +660,38 @@ def call_ollama(text: str) -> dict:
         r.raise_for_status()
         body = r.json()
         raw = (body.get("response") or "").strip()
+        done_reason = body.get("done_reason") or ""
+        eval_count = body.get("eval_count")
+        log.info(
+            "Ollama: response len=%d chars, eval_count=%s, done_reason=%s",
+            len(raw), eval_count, done_reason,
+        )
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             m = re.search(r"\{.*\}", raw, re.DOTALL)
             if not m:
+                dump = _dump_debug(f"{source_file}.no-json.txt", raw)
                 raise FileExtractionError(
-                    f"Ollama response was not JSON: {raw[:500]}"
+                    f"Ollama response was not JSON (len={len(raw)}). "
+                    f"Full output dumped to: {dump}"
                 ) from exc
             try:
                 return json.loads(m.group(0))
             except json.JSONDecodeError as exc2:
+                dump = _dump_debug(f"{source_file}.partial-json.txt", raw)
+                hint = ""
+                if done_reason == "length" or (
+                    eval_count is not None and eval_count >= OLLAMA_NUM_PREDICT - 16
+                ):
+                    hint = (
+                        " — output hit num_predict ceiling; raise OLLAMA_NUM_PREDICT "
+                        "or split the source into smaller pieces."
+                    )
                 raise FileExtractionError(
-                    f"Ollama response could not be parsed as JSON: {raw[:500]}"
+                    f"Ollama response could not be parsed as JSON "
+                    f"(len={len(raw)}, eval_count={eval_count}, done_reason={done_reason}){hint}. "
+                    f"Full output dumped to: {dump}"
                 ) from exc2
 
     raise EnvironmentSkip(
@@ -865,7 +921,7 @@ def process_one(path: Path, state: dict, stats: RunStats) -> None:
         if not text.strip():
             raise FileExtractionError("Extracted text was empty")
 
-        raw = call_ollama(text)
+        raw = call_ollama(text, source_file=path.name)
         doc = validate_and_normalize(raw)
 
         processed_at = datetime.now().isoformat(timespec="seconds")

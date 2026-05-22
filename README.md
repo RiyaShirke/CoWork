@@ -101,6 +101,13 @@ every product row visible in the input — no summarising, no skipping.
    model with `$env:OLLAMA_MODEL = 'qwen2.5:7b'` etc. before running.
    (`llama3.2:1b` will hallucinate against this schema — don't use it.)
 
+   **GPU is auto-detected.** If `nvidia-smi` works on the host the script
+   also applies `docker-compose.gpu.yml` so Ollama loads weights into VRAM
+   (much faster, much less system RAM pressure). It then verifies the GPU
+   is actually visible inside the container and prints
+   `Inference mode: GPU (<card name>)` at the end. Force CPU even on a GPU
+   host with `$env:COWORK_FORCE_CPU = '1'` before running.
+
 2. **Register the scheduled task** (every 15 min):
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1
