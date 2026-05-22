@@ -382,12 +382,17 @@ def _run_paddleocr_on_image(image: Path) -> str:
         staged = scratch_path / image.name
         shutil.copy2(image, staged)
 
+        # Invoke via `python3 -c "import paddleocr; paddleocr.main()"` rather
+        # than the `paddleocr` console script — the script in the
+        # paddlecloud/paddleocr image looks up its own package metadata via
+        # importlib_metadata and that lookup is broken in some builds
+        # (PackageNotFoundError: paddleocr).
         cmd = [
             "docker", "run", "--rm",
             "-v", f"{scratch_path.resolve()}:/data",
             "-v", f"{PADDLE_CACHE_DIR.resolve()}:/root/.paddleocr",
             PADDLE_IMAGE,
-            "paddleocr",
+            "python3", "-c", "import paddleocr; paddleocr.main()",
             "--image_dir", f"/data/{image.name}",
             "--lang", PADDLE_LANG,
             "--use_gpu", "false",
