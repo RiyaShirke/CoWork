@@ -122,7 +122,7 @@ for ($i = 0; $i -lt 30; $i++) {
     } catch { Start-Sleep -Seconds 2 }
 }
 if (-not $kzReady) {
-    Write-Host "    WARNING: Kreuzberg did not become ready within 60s — worker will fall back to pdfplumber."
+    Write-Host "    WARNING: Kreuzberg did not become ready within 60s -- worker will fall back to pdfplumber."
 }
 
 # Verify GPU actually passed through into the container (otherwise the model
@@ -149,7 +149,7 @@ if ($LASTEXITCODE -ne 0) { throw "ollama pull failed for $Model" }
 
 $Mode = if ($GpuInContainer) { "GPU ($GpuName)" } elseif ($UseGpu) { "CPU (GPU detected but not passing through)" } else { "CPU" }
 
-$KreuzbergStatus = if ($kzReady) { "ready (http://localhost:8000)" } else { "NOT READY — pdfplumber fallback will be used" }
+$KreuzbergStatus = if ($kzReady) { "ready (http://localhost:8000)" } else { "NOT READY -- pdfplumber fallback will be used" }
 
 Write-Host ""
 Write-Host "Bootstrap complete."
