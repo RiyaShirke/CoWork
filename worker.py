@@ -148,10 +148,10 @@ BATCH_COLUMNS = [
 ]
 
 EXCEL_COLUMNS = (
-    ["processed_at", "source_file"]
-    + REPORT_META_COLUMNS
-    + PRODUCT_COLUMNS
+    PRODUCT_COLUMNS
     + BATCH_COLUMNS
+    + REPORT_META_COLUMNS
+    + ["processed_at", "source_file"]
 )
 
 PDF_EXTS = {".pdf"}
@@ -1029,10 +1029,11 @@ def flatten_rows(doc: ExtractedDoc, source_file: str, processed_at: str) -> list
         if not batches:
             batches = [blank_batch]
         for batch in batches:
-            row = [processed_at, source_file]
-            row.extend(doc.metadata.get(col, "") for col in REPORT_META_COLUMNS)
+            row: list[Any] = []
             row.extend(product.get(col, "") for col in PRODUCT_COLUMNS)
             row.extend(batch.get(col, "") for col in BATCH_COLUMNS)
+            row.extend(doc.metadata.get(col, "") for col in REPORT_META_COLUMNS)
+            row.extend([processed_at, source_file])
             rows.append(row)
     return rows
 
@@ -1058,11 +1059,26 @@ def _load_or_create_workbook() -> tuple[Workbook, Any]:
     if OUTPUT_XLSX.exists():
         wb = load_workbook(OUTPUT_XLSX)
         ws = wb.active
-        # Heal a workbook missing the header row.
-        if ws.max_row == 0 or [c.value for c in ws[1]] != EXCEL_COLUMNS:
-            if ws.max_row == 0:
-                ws.append(EXCEL_COLUMNS)
-        return wb, ws
+        existing_header = [c.value for c in ws[1]] if ws.max_row >= 1 else []
+        if existing_header == EXCEL_COLUMNS:
+            return wb, ws
+        # Schema mismatch (column reorder, rename, etc.). Archive the old file
+        # so a manual `rm bills.xlsx` is never needed; new workbook starts clean.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        archived = OUTPUT_XLSX.with_name(f"{OUTPUT_XLSX.stem}.legacy-{stamp}.xlsx")
+        try:
+            wb.close()
+        except Exception:
+            pass
+        try:
+            OUTPUT_XLSX.replace(archived)
+            log.warning(
+                "Output workbook header doesn't match current schema; "
+                "archived old file to %s and starting a fresh workbook.",
+                archived.name,
+            )
+        except OSError as exc:
+            log.warning("Could not archive old workbook (%s); will append anyway.", exc)
     wb = Workbook()
     ws = wb.active
     ws.title = "inventory"
